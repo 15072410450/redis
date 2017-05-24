@@ -49,6 +49,9 @@
 #define UNUSED(V) ((void) V)
 #define RANDPTR_INITIAL_SIZE 8
 
+static const char* __key__ = "__key_file__";
+static const char* __value__ = "__value_file__";
+
 static struct config {
     aeEventLoop *el;
     const char *hostip;
@@ -79,6 +82,9 @@ static struct config {
     sds dbnumstr;
     char *tests;
     char *auth;
+
+    const char *key_filename;
+    const char *value_filename;
 } config;
 
 typedef struct _client {
@@ -95,6 +101,18 @@ typedef struct _client {
                                such as auth and select are prefixed to the pipeline of
                                benchmark commands and discarded after the first send. */
     int prefixlen;          /* Size in bytes of the pending prefix commands */
+
+    char* key_filename;
+    FILE* key_fp;
+    char *key_ptr;
+    size_t key_len;
+
+    char* value_filename;
+    FILE* value_fp;
+    sds value_ptr;
+    size_t value_len;
+
+    sds ofmt;
 } *client;
 
 /* Prototypes */
@@ -129,6 +147,10 @@ static void freeClient(client c) {
     redisFree(c->context);
     sdsfree(c->obuf);
     zfree(c->randptr);
+
+    free(c->key_filename);
+    free(c->value_filename);
+
     zfree(c);
     config.liveclients--;
     ln = listSearchKey(config.clients,c);
@@ -138,6 +160,13 @@ static void freeClient(client c) {
 
 static void freeAllClients(void) {
     listNode *ln = config.clients->head, *next;
+
+    if (ln && ((client)ln->value)->key_fp) {
+        fclose(((client)ln->value)->key_fp);
+    }
+    if (ln && ((client)ln->value)->value_fp) {
+        fclose(((client)ln->value)->value_fp);
+    }
 
     while(ln) {
         next = ln->next;
@@ -168,6 +197,65 @@ static void randomizeClientKey(client c) {
             p--;
         }
     }
+}
+
+static void readClientValueFromFile(client c) {
+    sds tmp = c->obuf;
+	char key_fmt[256];
+	ssize_t key_len = 0;
+	if (config.key_filename) {
+		snprintf(key_fmt, 256, "$%zu\r\n%s\r\n", strlen(__key__), __key__);
+		key_len = getline(&c->key_ptr, &c->key_len, c->key_fp);
+		if (feof(c->key_fp)) {
+			fseek(c->key_fp, 0, SEEK_SET);
+		}
+	}
+    char value_fmt[256];
+    ssize_t value_len = 0;
+	if (config.value_filename) {
+		snprintf(value_fmt, 256, "$%zu\r\n%s\r\n", strlen(__value__), __value__);
+		char* value_ptr = NULL;
+		size_t value_size = 0;
+		sdsclear(c->value_ptr);
+		do {
+			value_len = getline(&value_ptr, &value_size, c->value_fp);
+		    if (feof(c->value_fp)) {
+		    	fseek(c->value_fp, 0, SEEK_SET);
+		    }
+		    if (value_ptr)
+		    	c->value_ptr = sdscatlen(c->value_ptr, value_ptr, (size_t)value_len);
+		} while (!strstr(value_ptr, "review/text:"));
+		value_len = sdslen(c->value_ptr);
+	}
+    c->obuf = sdsempty();
+    c->obuf = sdscatlen(c->obuf, c->ofmt, c->prefixlen);
+    sds start = c->ofmt + c->prefixlen, cur = start;
+    while (cur) {
+    	if (config.key_filename && (cur = strstr(start, key_fmt)) != NULL) {
+            char *str = (char*)malloc(256 + key_len);
+            c->obuf = sdscatlen(c->obuf, start, cur - start); // string before "$2\r\n%s\r\n"
+        	int length = snprintf(str, 256 + key_len, "$%zu\r\n%s\r\n", (size_t)key_len, c->key_ptr);
+        	c->obuf = sdscatlen(c->obuf, str, (size_t)length); // string to replace "$2\r\n%s\r\n"
+            free(str);
+            start = cur + strlen(key_fmt); // skip "$zu\r\n%s\r\n"
+    	}
+    	else if (config.value_filename && (cur = strstr(start, value_fmt)) != NULL) {
+            char *str = (char*)malloc(256 + value_len);
+            c->obuf = sdscatlen(c->obuf, start, cur - start); // string before "$2\r\n%s\r\n"
+        	int length = snprintf(str,256 + value_len, "$%zu\r\n%s\r\n", (size_t)value_len, c->value_ptr);
+        	c->obuf = sdscatlen(c->obuf, str, (size_t)length); // string to replace "$2\r\n%s\r\n"
+            free(str);
+            start = cur + strlen(value_fmt); // skip "$zu\r\n%s\r\n"
+    	}
+    }
+    c->obuf = sdscatlen(c->obuf, start, sdslen(c->ofmt) - (start - c->ofmt));
+
+    // make randomptrs point to new obuf
+    size_t i;
+    for (i = 0; i < c->randlen; i++) {
+    	c->randptr[i] = c->obuf + (c->randptr[i] - tmp);
+    }
+    sdsfree(tmp);
 }
 
 static void clientDone(client c) {
@@ -269,8 +357,12 @@ static void writeHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
             return;
         }
 
+        //if need, read value from values source file, must before randomizeClientKey(), because c->obuf will be realloc
+        if (config.key_filename || config.value_filename) readClientValueFromFile(c);
+
         /* Really initialize: randomize keys and set start time. */
         if (config.randomkeys) randomizeClientKey(c);
+
         c->start = ustime();
         c->latency = -1;
     }
@@ -374,6 +466,65 @@ static client createClient(char *cmd, size_t len, client from) {
     c->randptr = NULL;
     c->randlen = 0;
 
+    // new added
+    c->ofmt = sdsdup(c->obuf);
+
+    c->key_filename = NULL;
+    c->key_fp = NULL;
+    c->key_ptr = NULL;
+    c->key_len = 0;
+
+    c->value_filename = NULL;
+    c->value_fp = NULL;
+    c->value_ptr = sdsempty();
+    c->value_len = 0;
+
+    if (config.key_filename) {
+    	if (config.randomkeys) {
+    		config.randomkeys = 0;
+    		printf("--key_file is used, so --randomkeys cancelled.\n");
+    	}
+    	if (from) {
+        	c->key_filename = strdup(from->key_filename);
+        	c->key_fp = from->key_fp;
+    	}
+    	else {
+        	c->key_filename = strdup(config.key_filename);
+        	c->key_fp = fopen(c->key_filename, "r");
+        	if (!c->key_fp) {
+        		printf("Cannot open values source file %s\n", c->key_filename);
+        		exit(-1);
+        	}
+        	fseek(c->key_fp, 0, SEEK_END);
+        	if (ftell(c->key_fp) <= 0) {
+        		printf("%s is an empty file\n", c->key_filename);
+        		exit(-1);
+        	}
+        	fseek(c->key_fp, 0, SEEK_SET);
+    	}
+    }
+
+    if (config.value_filename) {
+    	if (from) {
+        	c->value_filename = strdup(from->value_filename);
+        	c->value_fp = from->value_fp;
+    	}
+    	else {
+        	c->value_filename = strdup(config.value_filename);
+        	c->value_fp = fopen(c->value_filename, "r");
+        	if (!c->value_fp) {
+        		printf("Cannot open values source file %s\n", c->value_filename);
+        		exit(-1);
+        	}
+        	fseek(c->value_fp, 0, SEEK_END);
+        	if (ftell(c->value_fp) <= 0) {
+        		printf("%s is an empty file\n", c->value_filename);
+        		exit(-1);
+        	}
+        	fseek(c->value_fp, 0, SEEK_SET);
+    	}
+    }
+
     /* Find substrings in the output buffer that need to be randomized. */
     if (config.randomkeys) {
         if (from) {
@@ -403,6 +554,7 @@ static client createClient(char *cmd, size_t len, client from) {
             }
         }
     }
+
     if (config.idlemode == 0)
         aeCreateFileEvent(config.el,c->context->fd,AE_WRITABLE,writeHandler,c);
     listAddNodeTail(config.clients,c);
@@ -546,6 +698,15 @@ int parseOptions(int argc, const char **argv) {
             if (lastarg) goto invalid;
             config.dbnum = atoi(argv[++i]);
             config.dbnumstr = sdsfromlonglong(config.dbnum);
+
+        } else if (!strcmp(argv[i],"--key_file")) {
+        	if (lastarg) goto invalid;
+        	config.key_filename = strdup(argv[++i]);
+
+        } else if (!strcmp(argv[i],"--value_file")) {
+        	if (lastarg) goto invalid;
+        	config.value_filename = strdup(argv[++i]);
+
         } else if (!strcmp(argv[i],"--help")) {
             exit_status = 0;
             goto usage;
@@ -565,7 +726,7 @@ invalid:
 
 usage:
     printf(
-"Usage: redis-benchmark [-h <host>] [-p <port>] [-c <clients>] [-n <requests>] [-k <boolean>]\n\n"
+"Usage: redis-benchmark [-h <host>] [-p <port>] [-c <clients>] [-n <requests]> [-k <boolean>]\n\n"
 " -h <hostname>      Server hostname (default 127.0.0.1)\n"
 " -p <port>          Server port (default 6379)\n"
 " -s <socket>        Server socket (overrides host and port)\n"
@@ -645,9 +806,32 @@ int test_is_selected(char *name) {
     return strstr(config.tests,buf) != NULL;
 }
 
+/**
+ * added by user
+ */
+int get_option_and_args_with_prefix(char *name, char* args) {
+	char buf[256];
+	int l = strlen(name);
+
+	if (config.tests == NULL) return 1;
+	buf[0] = ',';
+	memcpy(buf+1, name, l);
+	char* pOption = strstr(config.tests, buf);
+	pOption = pOption ? pOption + 1 : NULL; // +1 to skip the beginning ','
+
+	if (!pOption) return 0;
+
+	char* pArgs = pOption + l + 1; // +1 to skip the '_'
+	char* pArgsEnd = strchr(pOption, ',');
+	assert(pArgsEnd);
+	memcpy(args, pArgs, pArgsEnd - pArgs);
+
+	return 1;
+}
+
 int main(int argc, const char **argv) {
     int i;
-    char *data, *cmd;
+    char *key, *data, *cmd;
     int len;
 
     client c;
@@ -679,6 +863,9 @@ int main(int argc, const char **argv) {
     config.tests = NULL;
     config.dbnum = 0;
     config.auth = NULL;
+
+    config.key_filename = NULL;
+    config.value_filename = NULL;
 
     i = parseOptions(argc,argv);
     argc -= i;
@@ -716,10 +903,27 @@ int main(int argc, const char **argv) {
     }
 
     /* Run default benchmark suite. */
-    data = zmalloc(config.datasize+1);
+    key = zmalloc(12+1);
+    if (config.value_filename) {
+    	data = zmalloc(strlen(__value__) + 1);
+    }
+    else{
+        data = zmalloc(config.datasize+1);
+    }
     do {
-        memset(data,'x',config.datasize);
-        data[config.datasize] = '\0';
+    	if (config.key_filename) {
+    		strcpy(key, __key__);
+    	}
+    	else {
+    		strcpy(key, "key:__rand_int__");
+    	}
+    	if (config.value_filename) {
+    		strcpy(data, __value__);
+    	}
+    	else {
+            memset(data,'x',config.datasize);
+            data[config.datasize] = '\0';
+    	}
 
         if (test_is_selected("ping_inline") || test_is_selected("ping"))
             benchmark("PING_INLINE","PING\r\n",6);
@@ -731,13 +935,13 @@ int main(int argc, const char **argv) {
         }
 
         if (test_is_selected("set")) {
-            len = redisFormatCommand(&cmd,"SET key:__rand_int__ %s",data);
+            len = redisFormatCommand(&cmd,"SET %s %s", key, data);
             benchmark("SET",cmd,len);
             free(cmd);
         }
 
         if (test_is_selected("get")) {
-            len = redisFormatCommand(&cmd,"GET key:__rand_int__");
+            len = redisFormatCommand(&cmd,"GET %s", key);
             benchmark("GET",cmd,len);
             free(cmd);
         }
@@ -824,12 +1028,28 @@ int main(int argc, const char **argv) {
             const char *argv[21];
             argv[0] = "MSET";
             for (i = 1; i < 21; i += 2) {
-                argv[i] = "key:__rand_int__";
+                argv[i] = key;
                 argv[i+1] = data;
             }
             len = redisFormatCommandArgv(&cmd,21,argv,NULL);
             benchmark("MSET (10 keys)",cmd,len);
             free(cmd);
+        }
+
+        //added by user
+        char args[16];
+        if (get_option_and_args_with_prefix("mget", args)) {
+        	const int cnt = atoi(args);
+        	const char *argv[cnt + 1];
+        	argv[0] = "MGET";
+        	for (i = 1; i < cnt + 1; ++i) {
+        		argv[i] = key;
+        	}
+        	len = redisFormatCommandArgv(&cmd, cnt + 1, argv, NULL);
+        	char title[256];
+        	snprintf(title, 256, "MGET (%d keys)", cnt);
+        	benchmark(title, cmd, len);
+        	free(cmd);
         }
 
         if (!config.csv) printf("\n");
