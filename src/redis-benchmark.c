@@ -200,12 +200,12 @@ static void randomizeClientKey(client c) {
 }
 
 static void readClientValueFromFile(client c) {
-    sds tmp = c->obuf;
+    sds tmp = c->obuf; // hold the pointer of c->obuf
 	char key_fmt[256];
 	ssize_t key_len = 0;
 	if (config.key_filename) {
-		snprintf(key_fmt, 256, "$%zu\r\n%s\r\n", strlen(__key__), __key__);
-		key_len = getline(&c->key_ptr, &c->key_len, c->key_fp);
+		snprintf(key_fmt, 256, "$%zu\r\n%s\r\n", strlen(__key__), __key__); // form key's format string
+		key_len = getline(&c->key_ptr, &c->key_len, c->key_fp); // read keys from file
 		if (feof(c->key_fp)) {
 			fseek(c->key_fp, 0, SEEK_SET);
 		}
@@ -213,42 +213,44 @@ static void readClientValueFromFile(client c) {
     char value_fmt[256];
     ssize_t value_len = 0;
 	if (config.value_filename) {
-		snprintf(value_fmt, 256, "$%zu\r\n%s\r\n", strlen(__value__), __value__);
+		snprintf(value_fmt, 256, "$%zu\r\n%s\r\n", strlen(__value__), __value__); // form value's format string
 		char* value_ptr = NULL;
 		size_t value_size = 0;
 		sdsclear(c->value_ptr);
-		do {
+		do { // read values from file
 			value_len = getline(&value_ptr, &value_size, c->value_fp);
 		    if (feof(c->value_fp)) {
 		    	fseek(c->value_fp, 0, SEEK_SET);
 		    }
 		    if (value_ptr)
 		    	c->value_ptr = sdscatlen(c->value_ptr, value_ptr, (size_t)value_len);
-		} while (!strstr(value_ptr, "review/text:"));
+		} while (!strstr(value_ptr, "review/text:")); // one value = product/productId + ... + review/text,
+													  // to make sure values' count equal to keys' count
+													  // and all data in the file will be stored in database by "set"
 		value_len = sdslen(c->value_ptr);
 	}
-    c->obuf = sdsempty();
+    c->obuf = sdsempty(); // form the command
     c->obuf = sdscatlen(c->obuf, c->ofmt, c->prefixlen);
     sds start = c->ofmt + c->prefixlen, cur = start;
     while (cur) {
     	if (config.key_filename && (cur = strstr(start, key_fmt)) != NULL) {
             char *str = (char*)malloc(256 + key_len);
-            c->obuf = sdscatlen(c->obuf, start, cur - start); // string before "$2\r\n%s\r\n"
+            c->obuf = sdscatlen(c->obuf, start, cur - start); // string before "$%zu\r\n%s\r\n"
         	int length = snprintf(str, 256 + key_len, "$%zu\r\n%s\r\n", (size_t)key_len, c->key_ptr);
-        	c->obuf = sdscatlen(c->obuf, str, (size_t)length); // string to replace "$2\r\n%s\r\n"
+        	c->obuf = sdscatlen(c->obuf, str, (size_t)length); // string to replace "$%zu\r\n%s\r\n"
             free(str);
-            start = cur + strlen(key_fmt); // skip "$zu\r\n%s\r\n"
+            start = cur + strlen(key_fmt); // skip "$%zu\r\n%s\r\n"
     	}
     	else if (config.value_filename && (cur = strstr(start, value_fmt)) != NULL) {
             char *str = (char*)malloc(256 + value_len);
-            c->obuf = sdscatlen(c->obuf, start, cur - start); // string before "$2\r\n%s\r\n"
+            c->obuf = sdscatlen(c->obuf, start, cur - start); // string before "$%zu\r\n%s\r\n"
         	int length = snprintf(str,256 + value_len, "$%zu\r\n%s\r\n", (size_t)value_len, c->value_ptr);
-        	c->obuf = sdscatlen(c->obuf, str, (size_t)length); // string to replace "$2\r\n%s\r\n"
+        	c->obuf = sdscatlen(c->obuf, str, (size_t)length); // string to replace "$%zu\r\n%s\r\n"
             free(str);
-            start = cur + strlen(value_fmt); // skip "$zu\r\n%s\r\n"
+            start = cur + strlen(value_fmt); // skip "$%zu\r\n%s\r\n"
     	}
     }
-    c->obuf = sdscatlen(c->obuf, start, sdslen(c->ofmt) - (start - c->ofmt));
+    c->obuf = sdscatlen(c->obuf, start, sdslen(c->ofmt) - (start - c->ofmt)); //the remainder
 
     // make randomptrs point to new obuf
     size_t i;
