@@ -104,12 +104,12 @@ typedef struct _client {
 
     char* key_filename;
     FILE* key_fp;
-    char *key_ptr;
+    char* key_ptr;
     size_t key_len;
 
     char* value_filename;
     FILE* value_fp;
-    sds value_ptr;
+    char* value_ptr;
     size_t value_len;
 
     sds ofmt;
@@ -214,21 +214,11 @@ static void readClientValueFromFile(client c) {
     ssize_t value_len = 0;
 	if (config.value_filename) {
 		snprintf(value_fmt, 256, "$%zu\r\n%s\r\n", strlen(__value__), __value__); // form value's format string
-		char* value_ptr = NULL;
-		size_t value_size = 0;
+		value_len = getline(&c->value_ptr, &c->value_len, c->value_fp);
 		sdsclear(c->value_ptr);
-		do { // read values from file
-			value_len = getline(&value_ptr, &value_size, c->value_fp);
-		    if (feof(c->value_fp)) {
-		    	fseek(c->value_fp, 0, SEEK_SET);
-		    }
-		    if (value_ptr)
-		    	c->value_ptr = sdscatlen(c->value_ptr, value_ptr, (size_t)value_len);
-		} while (!strstr(value_ptr, "review/text:")); // one value = product/productId + ... + review/text,
-													  // to make sure values' count equal to keys' count
-													  // and all data in the file will be stored in database by "set"
 		value_len = sdslen(c->value_ptr);
 	}
+
     c->obuf = sdsempty(); // form the command
     c->obuf = sdscatlen(c->obuf, c->ofmt, c->prefixlen);
     sds start = c->ofmt + c->prefixlen, cur = start;
@@ -700,15 +690,14 @@ int parseOptions(int argc, const char **argv) {
             if (lastarg) goto invalid;
             config.dbnum = atoi(argv[++i]);
             config.dbnumstr = sdsfromlonglong(config.dbnum);
-
-        } else if (!strcmp(argv[i],"--key_file")) {
+        } else if (!strcmp(argv[i],"-K")) {
+            printf("Enter -K branch\n");
         	if (lastarg) goto invalid;
         	config.key_filename = strdup(argv[++i]);
-
-        } else if (!strcmp(argv[i],"--value_file")) {
+        } else if (!strcmp(argv[i],"-V")) {
+            printf("Enter -V branch\n");
         	if (lastarg) goto invalid;
         	config.value_filename = strdup(argv[++i]);
-
         } else if (!strcmp(argv[i],"--help")) {
             exit_status = 0;
             goto usage;
@@ -738,6 +727,7 @@ usage:
 " -d <size>          Data size of SET/GET value in bytes (default 2)\n"
 " -dbnum <db>        SELECT the specified db number (default 0)\n"
 " -k <boolean>       1=keep alive 0=reconnect (default 1)\n"
+" -K <file>          Get KeyFiles\n"
 " -r <keyspacelen>   Use random keys for SET/GET/INCR, random values for SADD\n"
 "  Using this option the benchmark will expand the string __rand_int__\n"
 "  inside an argument with a 12 digits number in the specified range\n"
